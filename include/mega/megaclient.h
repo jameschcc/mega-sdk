@@ -52,6 +52,7 @@
 #include <mega/file_service/file_service.h>
 #include <mega/fuse/common/service.h>
 
+#include <deque>
 #include <optional>
 
 namespace mega {
@@ -1857,6 +1858,14 @@ public:
     bool sc_checkSequenceTag(const string& tag);
     bool sc_checkActionPacket(JSON& json, Node* lastAPDeletedNode);
 
+    // streaming actionpacket processing helpers
+    bool processActionPacketObject(JSON& json, std::shared_ptr<Node>& lastAPDeletedNode);
+    void initScStreamingFilters();
+    void processPendingActionPackets();
+    void finishScStreaming();
+    void startScStreaming();
+    void abortScStreaming();
+
     void sc_updatenode(JSON& json);
     std::shared_ptr<Node> sc_deltree(JSON& json, bool& moveOperation);
     handle sc_newnodes(JSON& json);
@@ -2103,6 +2112,16 @@ public:
     JSON jsonsc;
     bool insca;
     bool insca_notlast;
+
+    // Streaming actionpacket parsing state
+    JSONSplitter mScJsonSplitter;
+    std::map<string, JSONSplitter::FilterCallback> mScFilters;
+    std::deque<string> mScPendingActionPackets;
+    std::shared_ptr<Node> mScLastAPDeletedNode;
+    std::unique_lock<std::recursive_mutex> mScNodeTreeLock;
+    bool mScStreamingActive = false;
+    bool mScStreamingFinished = false;
+    bool mScOriginalAC = false;
 
     // no two interrelated client instances should ever have the same sessionid
     char sessionid[10];
