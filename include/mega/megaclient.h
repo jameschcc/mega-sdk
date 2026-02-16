@@ -52,6 +52,7 @@
 #include <mega/file_service/file_service.h>
 #include <mega/fuse/common/service.h>
 
+#include <deque>
 #include <optional>
 
 namespace mega {
@@ -1892,6 +1893,18 @@ public:
     // enter json object to check the action packet, then restore json position
     bool sc_checkActionPacketPreservePos(JSON& json, const Node* lastAPDeletedNode);
 
+    // Streaming actionpacket processing (mirrors CommandFetchNodes streaming for 'f' responses)
+    // These functions enable incremental parsing and processing of actionpackets as data arrives
+    // from the server, avoiding the need to buffer large responses in memory
+    
+    bool processActionPacketObject(JSON& json, std::shared_ptr<Node>& lastAPDeletedNode);  // Process one actionpacket with sequence tag checking
+    bool processActionPacketTreeStreaming(JSON& json);  // Process node tree data ('t' actionpackets) with streaming
+    void initScStreamingFilters();                      // Initialize JSON filter callbacks for SC response patterns
+    void processPendingActionPackets();                 // Process all queued actionpackets that are ready
+    void finishScStreaming();                           // Complete streaming and perform end-of-operations processing
+    void startScStreaming();                            // Begin streaming actionpacket parsing session
+    void abortScStreaming();                            // Abort streaming (on error/timeout) and clean up state
+
     void sc_updatenode(JSON& json);
     std::shared_ptr<Node> sc_deltree(JSON& json, bool& moveOperation);
     handle sc_newnodes(JSON& json);
@@ -2138,6 +2151,17 @@ public:
     JSON jsonsc;
     bool insca;
     bool insca_notlast;
+
+    // Streaming actionpacket parsing state (mirrors CommandFetchNodes streaming approach)
+    // Allows incremental processing of server-client actionpackets without buffering entire response
+    JSONSplitter mScJsonSplitter;                      // Incremental JSON parser for SC response
+    std::map<string, JSONSplitter::FilterCallback> mScFilters;  // Callbacks for JSON patterns (e.g., "{\"w", "{[a{")
+    std::deque<string> mScPendingActionPackets;        // Queue of actionpackets waiting to be processed
+    std::shared_ptr<Node> mScLastAPDeletedNode;        // Last deleted node (for move command special handling)
+    std::unique_lock<std::recursive_mutex> mScNodeTreeLock;  // Lock to prevent sync threads seeing inconsistent tree
+    bool mScStreamingActive = false;                   // True while actively parsing/processing a streaming SC response
+    bool mScStreamingFinished = false;                 // True when JSONSplitter has finished parsing
+    bool mScOriginalAC = false;                        // Saved actionpacketsCurrent value (restored after streaming)
 
     // no two interrelated client instances should ever have the same sessionid
     char sessionid[10];
