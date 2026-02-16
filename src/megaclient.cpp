@@ -15550,43 +15550,68 @@ void MegaClient::resumeTransferFromDB()
         bool requiredStatxfer{true};
 
         const int tag = nextreqtag();
+        
+        // Verify MAC before resuming remote copy to ensure file content still matches
         if (!data.sameNodeHandle.isUndef())
         {
             assert(type == PUT);
-            auto [start, end] = multi_cachedtransfers[type].equal_range(file);
-            Transfer* t{nullptr};
-            for (auto& it = start; it != end;)
+            auto parent = mNodeManager.getNodeByHandle(data.parentHandle);
+            if (!parent)
             {
-                requiredStatxfer = false;
-                t = it->second;
-                assert(t->localfilename == file->getLocalname());
-                it = multi_cachedtransfers[type].erase(it);
-                t->tag = tag;
-                file->tag = tag;
-
-                file->file_it = t->files.insert(t->files.end(), file);
-                file->transfer = t;
-                auto parent = mNodeManager.getNodeByHandle(data.parentHandle);
-                if (!parent)
-                {
-                    LOG_err << "Error resuming transfer via copy remote - No parent";
-                    // file is auto removed
-                    t->removeTransferFile(API_ENOENT, file, &committer);
-                    t->removeAndDeleteSelf(transferstate_t::TRANSFERSTATE_FAILED);
-                    continue;
-                }
-
+                LOG_err << "Error resuming transfer via copy remote - No parent";
+                requiredStatxfer = true;
+            }
+            else
+            {
                 auto remoteCopyNode = mNodeManager.getNodeByHandle(data.sameNodeHandle);
                 // It should be valid, obtained in file_resume
                 assert(remoteCopyNode);
-                transferRemoteCopy(file,
-                                   remoteCopyNode,
-                                   data.remoteName,
-                                   parent,
-                                   tag,
-                                   std::nullopt,
-                                   data.inboxTarget);
-                break;
+
+                // Verify both fingerprint and MAC match before using remote copy
+                const auto compareResult = CompareLocalFileWithNodeMacAndFpExludingMtime(*this,
+                                                                           file->getLocalname(),
+                                                                           *file,
+                                                                           remoteCopyNode.get());
+                
+                if (compareResult.first == NODE_COMP_EQUAL)
+                {
+                    auto [start, end] = multi_cachedtransfers[type].equal_range(file);
+                    Transfer* t{nullptr};
+                    for (auto& it = start; it != end;)
+                    {
+                        requiredStatxfer = false;
+                        t = it->second;
+                        assert(t->localfilename == file->getLocalname());
+                        
+                        it = multi_cachedtransfers[type].erase(it);
+                        t->tag = tag;
+                        file->tag = tag;
+
+                        file->file_it = t->files.insert(t->files.end(), file);
+                        file->transfer = t;
+
+                        transferRemoteCopy(file,
+                                           remoteCopyNode,
+                                           data.remoteName,
+                                           parent,
+                                           tag,
+                                           std::nullopt,
+                                           data.inboxTarget);
+                        break;
+                    }
+
+                    if (!t)
+                    {
+                        requiredStatxfer = true;
+                    }
+                }
+                else
+                {
+                    // MAC mismatch - file content differs, perform full upload
+                    LOG_debug << "Fingerprint match found during resume, but MAC mismatch or "
+                                 "read failed. Proceeding with upload.";
+                    requiredStatxfer = true;
+                }
             }
         }
 
@@ -18767,6 +18792,75 @@ bool MegaClient::startxfer(direction_t d, File* f, TransferDbCommitter& committe
                 // no valid fingerprint: use filekey as its replacement
                 memcpy(f->crc.data(), f->filekey, sizeof f->crc);
                 LOG_warn << "Downloading a file with invalid fingerprint, adjusted to: " << f->fingerprintDebugString() << " name: " << f->getLocalname();
+            }
+        }
+
+        // Check for duplicate files to use remote copy instead of uploading
+        if (d == PUT && f->targetuser.empty() && !f->h.isUndef() && !f->name.empty())
+        {
+            if (std::shared_ptr<Node> parent = nodeByHandle(f->h))
+            {
+                FileFingerprint fp_forCloud = *static_cast<FileFingerprint*>(f);
+                sharedNode_vector nodes = mNodeManager.getNodesByFingerprint(fp_forCloud);
+                std::shared_ptr<Node> sameNodeFpFound;
+
+                // Verify MAC for each fingerprint match to find truly identical file
+                for (auto& n : nodes)
+                {
+                    if (!n || n->type != FILENODE)
+                        continue;
+
+                    const auto compareResult = CompareLocalFileWithNodeMacAndFpExludingMtime(*this,
+                                                                               f->getLocalname(),
+                                                                               fp_forCloud,
+                                                                               n.get());
+                    
+                    if (compareResult.first == NODE_COMP_EQUAL)
+                    {
+                        sameNodeFpFound = n;
+                        break;
+                    }
+                }
+
+                if (sameNodeFpFound)
+                {
+                    LOG_debug << "Another node ("
+                              << Base64Str<MegaClient::NODEHANDLE>(sameNodeFpFound->nodehandle)
+                              << ") with same FP and MAC exists. Perform remote copy.";
+
+                    Transfer* t = new Transfer(this, d);
+                    *(FileFingerprint*)t = *(FileFingerprint*)f;
+                    t->skipserialization = donotpersist;
+                    t->lastaccesstime = m_time();
+                    t->tag = tag;
+                    f->tag = tag;
+                    t->transfers_it = multi_transfers[d].insert(pair<FileFingerprint*, Transfer*>((FileFingerprint*)t, t));
+
+                    f->file_it = t->files.insert(t->files.end(), f);
+                    f->transfer = t;
+                    if (!f->dbid && !donotpersist)
+                    {
+                        filecacheadd(f, committer);
+                    }
+
+                    transferlist.addtransfer(t, committer, startfirst);
+                    app->transfer_added(t);
+                    app->file_added(f);
+
+                    // Perform server-side copy (no upload needed)
+                    auto copyResult = transferRemoteCopy(f,
+                                                         sameNodeFpFound,
+                                                         f->name,
+                                                         parent,
+                                                         tag,
+                                                         std::nullopt,
+                                                         std::nullopt);
+                    if (copyResult == API_OK)
+                    {
+                        *cause = API_OK;
+                        return true;
+                    }
+                }
             }
         }
 
